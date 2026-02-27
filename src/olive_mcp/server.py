@@ -15,48 +15,59 @@ mcp = FastMCP(
     name="olive",
     instructions="""Olive MCP server for Microsoft Olive model optimization.
 
-## IMPORTANT: Async job pattern
-All long-running tools (optimize, quantize, finetune, etc.) run in the background and return a `job_id` immediately.
-You MUST then poll `get_job_status(job_id)` to check progress and get results.
+## CRITICAL: Ask before you run
+**NEVER start an optimization/quantization/finetune job without first confirming these with the user:**
+1. **Target device** — "Will you run this model on CPU, GPU (NVIDIA/AMD), or NPU?" This determines provider, precision support, and speed.
+2. **Goal** — "Do you want the smallest model, best quality, or a balance?" This determines precision and algorithm.
+3. **Model** — Confirm which model to use. If the user didn't specify, suggest options based on their use case.
 
-**Workflow for every optimization task:**
-1. Call the tool (e.g. `optimize`) → returns `{"job_id": "xxx", "status": "running"}`
-2. Tell the user "Optimization started, checking progress..."
-3. Call `get_job_status("xxx")` → returns current status + recent olive log lines
-4. **ALWAYS show the user the `recent_logs` content** — this is the real olive output, the user wants to see it
-5. If status is "running", summarize what olive is doing based on the logs, then call `get_job_status` again
-6. Keep polling until status is "completed" or "error"
-7. Show the user the final result (model path, metrics, etc.)
+**Do NOT assume CPU by default.** Do NOT guess and retry on failure. Ask the user first.
 
-**IMPORTANT: Always display the recent_logs to the user so they can see olive's progress. Do NOT silently poll without showing logs.**
+### Device constraints you MUST know:
+- **CPU**: Does NOT support fp16 precision. Use int4 or int8. Provider = CPUExecutionProvider.
+- **GPU (NVIDIA)**: Supports fp16, int4, int8. Provider = CUDAExecutionProvider.
+- **GPU (DirectML/Windows)**: Supports fp16, int4, int8. Provider = DmlExecutionProvider.
+- **NPU**: Provider = QNNExecutionProvider. Limited precision support.
+
+## Async job pattern
+All long-running tools run in the background and return a `job_id` immediately.
+Poll `get_job_status(job_id)` to check progress and get results.
+
+**Workflow:**
+1. **Ask the user** about target device, goal, and model (see above)
+2. Call the tool → returns `{"job_id": "xxx", "status": "running"}`
+3. Call `get_job_status("xxx")` — it blocks up to 30s waiting for new logs, no need to add delay
+4. **ALWAYS show `recent_logs` to the user** — this is the real olive output
+5. If status is "running", summarize what olive is doing, then call `get_job_status` again
+6. If status is "completed" or "error", show the final result
+
 **Optimization can take 5-30+ minutes depending on model size. This is normal.**
 
 ## HuggingFace authentication
 Some models (e.g. gated models like meta-llama) require a HuggingFace token to download.
-- If a job fails with errors mentioning "401", "403", "authentication", "gated", or "Access denied", **ask the user for their HuggingFace token** and retry with the `hf_token` parameter.
-- You can get a token from https://huggingface.co/settings/tokens
-- The token is passed as an environment variable to the worker process and is NOT stored anywhere.
+- If a job fails with "401", "403", "authentication", "gated", or "Access denied", **ask the user for their HuggingFace token** and retry with `hf_token`.
+- Token from: https://huggingface.co/settings/tokens
+- Passed as env var, NOT stored anywhere.
 
 ## Choosing the right tool and parameters
 
-### IMPORTANT: optimize vs quantize for int4
-- `optimize` with int4 precision **always runs GPTQ calibration**, which is VERY SLOW on CPU (30min+ for small models).
-- For **fast int4 quantization on CPU**, use `quantize` with `algorithm="rtn"` instead. RTN is minutes vs hours.
-- Only recommend `optimize` + int4 when the user has a GPU and wants best quality, or is willing to wait.
-- For CPU users wanting int4: suggest `quantize(algorithm="rtn", precision="int4")` first, then optionally `optimize` with fp16 for graph optimizations.
+### optimize vs quantize for int4
+- `optimize` with int4 **always runs GPTQ calibration** — VERY SLOW on CPU (30min+).
+- For **fast int4 on CPU**, use `quantize` with `algorithm="rtn"`. Minutes vs hours.
+- Only use `optimize` + int4 when user has GPU or explicitly wants GPTQ quality.
 
 ### User intent → tool choice
-- **Smallest model / fast inference** → `quantize` with precision="int4", algorithm="rtn" (fast) or "gptq" (slow but better quality)
-- **Balanced size and quality** → `quantize` with precision="int8"
-- **Best quality / minimal degradation** → `optimize` with precision="fp16"
-- **Training / fine-tuning** → `finetune` with method="qlora" (less memory) or "lora"
+- **Smallest model / fast inference on CPU** → `quantize(precision="int4", algorithm="rtn")`
+- **Smallest model / fast inference on GPU** → `optimize(precision="int4", provider="CUDAExecutionProvider")`
+- **Balanced size and quality** → `quantize(precision="int8")`
+- **Best quality on GPU** → `optimize(precision="fp16", provider="CUDAExecutionProvider")`
+- **Fine-tuning** → `finetune(method="qlora")` (less memory) or `finetune(method="lora")`
 - **Just convert to ONNX** → `capture_onnx_graph`
-- **Deploy to specific hardware** → match provider: GPU→CUDAExecutionProvider, NPU→QNNExecutionProvider, DirectML→DmlExecutionProvider
 
 ## Popular model recommendations
-- **Text chat / general LLM**: microsoft/Phi-4-mini-instruct (small, fast), microsoft/Phi-4 (powerful)
+- **Text chat / general LLM**: microsoft/Phi-4-mini-instruct (small), microsoft/Phi-4 (powerful)
 - **Code generation**: microsoft/Phi-4-mini-instruct
-- **Image generation**: runwayml/stable-diffusion-v1-5 (SD 1.5), stabilityai/stable-diffusion-xl-base-1.0 (SDXL)
+- **Image generation**: runwayml/stable-diffusion-v1-5, stabilityai/stable-diffusion-xl-base-1.0
 - **Embedding / retrieval**: BAAI/bge-small-en-v1.5, sentence-transformers/all-MiniLM-L6-v2
 - **Vision + language**: microsoft/Phi-4-multimodal-instruct
 """,
