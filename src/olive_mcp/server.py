@@ -57,8 +57,6 @@ WORKER_PATH = Path(__file__).parent / "worker.py"
 # Constants
 # ---------------------------------------------------------------------------
 
-BASE_PACKAGES = ["olive-ai"]
-
 SUPPORTED_DEVICES = ["cpu", "gpu", "npu"]
 
 SUPPORTED_PROVIDERS = [
@@ -84,24 +82,98 @@ SUPPORTED_QUANT_ALGORITHMS = ["rtn", "gptq", "awq", "hqq"]
 
 SUPPORTED_QUANT_IMPLEMENTATIONS = ["olive", "ort", "bnb", "nvmo", "inc", "spinquant", "quarot", "awq", "autogptq"]
 
-PROVIDER_TO_ORT = {
-    "CPUExecutionProvider": "onnxruntime",
-    "CUDAExecutionProvider": "onnxruntime-gpu",
-    "TensorrtExecutionProvider": "onnxruntime-gpu",
-    "ROCMExecutionProvider": "onnxruntime-gpu",
-    "OpenVINOExecutionProvider": "onnxruntime-openvino",
-    "DmlExecutionProvider": "onnxruntime-directml",
-    "QNNExecutionProvider": "onnxruntime-qnn",
-    "VitisAIExecutionProvider": "onnxruntime",
-    "WebGpuExecutionProvider": "onnxruntime",
-    "NvTensorRTRTXExecutionProvider": "onnxruntime-gpu",
-}
-
 DEVICE_TO_DEFAULT_PROVIDER = {
     "cpu": "CPUExecutionProvider",
     "gpu": "CUDAExecutionProvider",
     "npu": "QNNExecutionProvider",
 }
+
+# Maps provider → olive-ai extras key for onnxruntime variant
+PROVIDER_TO_EXTRAS = {
+    "CPUExecutionProvider": "cpu",
+    "CUDAExecutionProvider": "gpu",
+    "TensorrtExecutionProvider": "gpu",
+    "ROCMExecutionProvider": "gpu",
+    "OpenVINOExecutionProvider": "openvino",
+    "DmlExecutionProvider": "directml",
+    "QNNExecutionProvider": "qnn",
+}
+
+# Maps provider → onnxruntime-genai variant (for ModelBuilder pass)
+PROVIDER_TO_GENAI = {
+    "CPUExecutionProvider": "onnxruntime-genai",
+    "CUDAExecutionProvider": "onnxruntime-genai-cuda",
+    "DmlExecutionProvider": "onnxruntime-genai-directml",
+}
+
+
+def _resolve_packages(command: str, provider: str | None = None, **kwargs) -> list[str]:
+    """Resolve all packages needed for a given olive command + options.
+
+    Uses olive-ai[extras] syntax to pull in the right onnxruntime variant,
+    plus any additional packages that specific passes/commands require.
+    """
+    extras = set()
+    extra_packages = []
+
+    # 1. Base ORT variant from provider
+    if provider:
+        ep_extra = PROVIDER_TO_EXTRAS.get(provider)
+        if ep_extra:
+            extras.add(ep_extra)
+
+    # 2. Command-specific extras
+    if command == "optimize":
+        # Default exporter is model_builder → needs onnxruntime-genai
+        exporter = kwargs.get("exporter") or "model_builder"
+        if exporter == "model_builder" and provider:
+            genai_pkg = PROVIDER_TO_GENAI.get(provider, "onnxruntime-genai")
+            extra_packages.append(genai_pkg)
+        elif exporter == "optimum_exporter":
+            extras.add("optimum")
+
+    elif command == "quantize":
+        algorithm = kwargs.get("algorithm", "rtn")
+        impl = kwargs.get("implementation", "olive")
+        if impl == "bnb":
+            extras.add("bnb")
+        elif impl == "inc":
+            extras.add("inc")
+        elif impl == "autogptq" or algorithm == "gptq":
+            extra_packages.extend(["auto-gptq", "optimum"])
+        elif impl == "awq" or algorithm == "awq":
+            extra_packages.append("autoawq")
+
+    elif command == "finetune":
+        method = kwargs.get("method", "lora")
+        if method == "qlora":
+            extras.add("finetune")  # includes bnb, peft, accelerate, etc.
+        else:
+            extras.add("lora")  # peft, accelerate, scipy
+
+    elif command == "capture_onnx_graph":
+        extras.add("capture-onnx-graph")  # optimum
+
+    elif command == "benchmark":
+        device = kwargs.get("device", "cpu")
+        if device == "gpu":
+            extras.add("gpu")
+        else:
+            extras.add("cpu")
+
+    elif command == "tune_session_params":
+        extras.add("tune-session-params")  # psutil
+
+    elif command == "diffusion_lora":
+        extras.add("diffusers")  # accelerate, peft, diffusers
+
+    # Build olive-ai install string
+    if extras:
+        olive_install = f"olive-ai[{','.join(sorted(extras))}]"
+    else:
+        olive_install = "olive-ai"
+
+    return [olive_install] + extra_packages
 
 
 # ---------------------------------------------------------------------------
@@ -220,12 +292,12 @@ async def _run_olive_background(
     job_id: str,
     command: str,
     kwargs: dict,
-    extra_packages: list[str],
+    packages: list[str],
 ):
     """Background task: run olive in isolated venv, stream logs to job."""
     try:
         _jobs[job_id]["status"] = "setting_up"
-        packages = [*BASE_PACKAGES, *extra_packages]
+        _job_log(job_id, f"Packages to install: {', '.join(packages)}")
         python_path = await _get_or_create_venv(packages, job_id)
 
         _jobs[job_id]["status"] = "running"
@@ -275,15 +347,17 @@ async def _run_olive_background(
         _job_log(job_id, f"Exception: {exc}")
 
 
-def _start_job(command: str, description: str, kwargs: dict, extra_packages: list[str]) -> dict:
-    """Create a job, launch background task, return immediately."""
+def _start_job(command: str, description: str, kwargs: dict, provider: str | None = None) -> dict:
+    """Create a job, resolve packages, launch background task, return immediately."""
     job_id = _create_job(command, description)
+    packages = _resolve_packages(command, provider=provider, **kwargs)
     asyncio.get_event_loop().create_task(
-        _run_olive_background(job_id, command, kwargs, extra_packages)
+        _run_olive_background(job_id, command, kwargs, packages)
     )
     return {
         "job_id": job_id,
         "status": "running",
+        "packages": packages,
         "message": f"Job started: {description}. Use get_job_status('{job_id}') to check progress.",
     }
 
@@ -306,7 +380,6 @@ async def list_supported_configs() -> dict:
         "quantization_algorithms": SUPPORTED_QUANT_ALGORITHMS,
         "quantization_implementations": SUPPORTED_QUANT_IMPLEMENTATIONS,
         "device_to_default_provider": DEVICE_TO_DEFAULT_PROVIDER,
-        "provider_to_ort_package": PROVIDER_TO_ORT,
     }
 
 
@@ -376,7 +449,6 @@ async def optimize(
     if not output_path:
         output_path = _make_output_path("optimize", model_name_or_path)
 
-    ort_package = PROVIDER_TO_ORT.get(provider, "onnxruntime")
     kwargs = _build_kwargs(
         model_name_or_path=model_name_or_path,
         provider=provider,
@@ -391,7 +463,7 @@ async def optimize(
         surgeries=surgeries,
         output_path=output_path,
     )
-    return _start_job("optimize", f"Optimize {model_name_or_path} ({precision}, {provider})", kwargs, [ort_package])
+    return _start_job("optimize", f"Optimize {model_name_or_path} ({precision}, {provider})", kwargs, provider=provider)
 
 
 @mcp.tool()
@@ -430,7 +502,7 @@ async def quantize(
         data_name=data_name,
         output_path=output_path,
     )
-    return _start_job("quantize", f"Quantize {model_name_or_path} ({algorithm}, {precision})", kwargs, ["onnxruntime"])
+    return _start_job("quantize", f"Quantize {model_name_or_path} ({algorithm}, {precision})", kwargs)
 
 
 @mcp.tool()
@@ -475,7 +547,7 @@ async def finetune(
         eval_split=eval_split,
         output_path=output_path,
     )
-    return _start_job("finetune", f"Finetune {model_name_or_path} ({method}) on {data_name}", kwargs, [])
+    return _start_job("finetune", f"Finetune {model_name_or_path} ({method}) on {data_name}", kwargs)
 
 
 @mcp.tool()
@@ -517,7 +589,7 @@ async def capture_onnx_graph(
         use_ort_genai=use_ort_genai if use_ort_genai else None,
         output_path=output_path,
     )
-    return _start_job("capture_onnx_graph", f"Capture ONNX from {model_name_or_path}", kwargs, ["onnxruntime"])
+    return _start_job("capture_onnx_graph", f"Capture ONNX from {model_name_or_path}", kwargs)
 
 
 @mcp.tool()
@@ -546,7 +618,6 @@ async def benchmark(
     if not output_path:
         output_path = _make_output_path("benchmark", model_name_or_path)
 
-    ort_package = "onnxruntime-gpu" if device == "gpu" else "onnxruntime"
     kwargs = _build_kwargs(
         model_name_or_path=model_name_or_path,
         tasks=tasks,
@@ -556,7 +627,7 @@ async def benchmark(
         limit=limit,
         output_path=output_path,
     )
-    return _start_job("benchmark", f"Benchmark {model_name_or_path} on {', '.join(tasks)}", kwargs, [ort_package])
+    return _start_job("benchmark", f"Benchmark {model_name_or_path} on {', '.join(tasks)}", kwargs)
 
 
 @mcp.tool()
@@ -613,7 +684,7 @@ async def diffusion_lora(
         merge_lora=merge_lora if merge_lora else None,
         output_path=output_path,
     )
-    return _start_job("diffusion_lora", f"Diffusion LoRA for {model_name_or_path}", kwargs, [])
+    return _start_job("diffusion_lora", f"Diffusion LoRA for {model_name_or_path}", kwargs)
 
 
 @mcp.tool()
@@ -643,7 +714,7 @@ async def tune_session_params(
         enable_cuda_graph=enable_cuda_graph if enable_cuda_graph else None,
         output_path=output_path,
     )
-    return _start_job("tune_session_params", f"Tune session params for {model_name_or_path}", kwargs, ["onnxruntime"])
+    return _start_job("tune_session_params", f"Tune session params for {model_name_or_path}", kwargs)
 
 
 @mcp.tool()
