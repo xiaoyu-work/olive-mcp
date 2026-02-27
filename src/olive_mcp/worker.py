@@ -1,0 +1,103 @@
+"""Olive MCP Worker - runs olive.cli.api in an isolated venv.
+
+This script is invoked by the MCP server in a task-specific virtual environment.
+It calls the Olive Python API and returns structured JSON results via stdout.
+
+Usage: python worker.py <command> <json_kwargs>
+"""
+
+import json
+import sys
+import traceback
+
+
+def serialize_workflow_output(result):
+    """Convert a WorkflowOutput (or None) into a JSON-serializable dict."""
+    if result is None:
+        return {"status": "success", "output_models": []}
+
+    output = {
+        "status": "success",
+        "device": result.from_device(),
+        "execution_provider": result.from_execution_provider(),
+        "output_models": [],
+    }
+
+    for m in result.get_output_models():
+        output["output_models"].append({
+            "model_path": m.model_path,
+            "model_id": m.model_id,
+            "model_type": m.model_type,
+            "metrics": m.metrics_value,
+            "inference_config": m.get_inference_config() or None,
+        })
+
+    best = result.get_best_candidate()
+    if best:
+        output["best_model"] = {
+            "model_path": best.model_path,
+            "model_id": best.model_id,
+            "model_type": best.model_type,
+            "metrics": best.metrics_value,
+            "inference_config": best.get_inference_config() or None,
+        }
+
+    return output
+
+
+def main():
+    # Redirect stdout to stderr so olive's internal prints don't pollute our JSON output.
+    original_stdout = sys.stdout
+    sys.stdout = sys.stderr
+
+    try:
+        command = sys.argv[1]
+        kwargs = json.loads(sys.argv[2])
+
+        from olive.cli.api import (
+            benchmark,
+            capture_onnx_graph,
+            convert_adapters,
+            diffusion_lora,
+            extract_adapters,
+            finetune,
+            generate_adapter,
+            generate_cost_model,
+            optimize,
+            quantize,
+            run,
+            tune_session_params,
+        )
+
+        dispatch = {
+            "optimize": optimize,
+            "quantize": quantize,
+            "finetune": finetune,
+            "capture_onnx_graph": capture_onnx_graph,
+            "benchmark": benchmark,
+            "diffusion_lora": diffusion_lora,
+            "generate_adapter": generate_adapter,
+            "convert_adapters": convert_adapters,
+            "extract_adapters": extract_adapters,
+            "tune_session_params": tune_session_params,
+            "generate_cost_model": generate_cost_model,
+            "run": run,
+        }
+
+        func = dispatch.get(command)
+        if func is None:
+            result = {"status": "error", "error": f"Unknown command: {command}"}
+        else:
+            workflow_output = func(**kwargs)
+            result = serialize_workflow_output(workflow_output)
+
+    except Exception:
+        result = {"status": "error", "error": traceback.format_exc()[-3000:]}
+
+    # Write JSON result to original stdout
+    original_stdout.write(json.dumps(result))
+    original_stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

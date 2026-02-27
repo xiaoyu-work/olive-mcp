@@ -5,7 +5,6 @@ description = "MCP server for Microsoft Olive model optimization"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "mcp[cli]",
-    "olive-ai",
 ]
 
 [project.scripts]
