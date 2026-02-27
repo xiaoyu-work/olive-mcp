@@ -57,15 +57,10 @@ def main():
         from olive.cli.api import (
             benchmark,
             capture_onnx_graph,
-            convert_adapters,
             diffusion_lora,
-            extract_adapters,
             finetune,
-            generate_adapter,
-            generate_cost_model,
             optimize,
             quantize,
-            run,
             tune_session_params,
         )
 
@@ -76,12 +71,7 @@ def main():
             "capture_onnx_graph": capture_onnx_graph,
             "benchmark": benchmark,
             "diffusion_lora": diffusion_lora,
-            "generate_adapter": generate_adapter,
-            "convert_adapters": convert_adapters,
-            "extract_adapters": extract_adapters,
             "tune_session_params": tune_session_params,
-            "generate_cost_model": generate_cost_model,
-            "run": run,
         }
 
         func = dispatch.get(command)

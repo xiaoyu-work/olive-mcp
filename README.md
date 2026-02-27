@@ -13,12 +13,7 @@ MCP server for Microsoft Olive model optimization. Provides tools for model opti
 | `capture_onnx_graph` | Capture ONNX graph via PyTorch Exporter or Model Builder |
 | `benchmark` | Model evaluation using lm-eval tasks |
 | `diffusion_lora` | Train LoRA adapters for diffusion models (SD 1.5, SDXL, Flux) |
-| `generate_adapter` | Generate ONNX model with adapters as inputs |
-| `convert_adapters` | Convert LoRA adapter weights for ONNX consumption |
-| `extract_adapters` | Extract LoRA adapters from PyTorch models |
 | `tune_session_params` | Auto-tune ONNX Runtime session parameters |
-| `generate_cost_model` | Generate cost model CSV for model splitting |
-| `run_workflow` | Run a custom Olive workflow from a JSON config |
 
 Each tool runs in an **isolated Python environment** (managed by uv) with the appropriate dependencies, so different onnxruntime variants (CPU, CUDA, DirectML, OpenVINO, etc.) never conflict.
 

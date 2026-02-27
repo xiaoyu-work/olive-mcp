@@ -41,7 +41,7 @@ When the user doesn't specify a model, suggest based on their use case:
 ## Multi-step workflow guidance
 - **Full pipeline**: optimize → benchmark → compare with original
 - **Fine-tune then deploy**: finetune → optimize (with the fine-tuned model) → benchmark
-- **Diffusion LoRA**: diffusion_lora → convert_adapters (if ONNX deployment needed)
+- **Diffusion LoRA**: diffusion_lora → optimize (for deployment)
 - **ONNX deployment**: capture_onnx_graph → tune_session_params → benchmark
 """,
 )
@@ -92,7 +92,7 @@ PROVIDER_TO_ORT = {
     "ROCMExecutionProvider": "onnxruntime-gpu",
     "OpenVINOExecutionProvider": "onnxruntime-openvino",
     "DmlExecutionProvider": "onnxruntime-directml",
-    "QNNExecutionProvider": "onnxruntime",
+    "QNNExecutionProvider": "onnxruntime-qnn",
     "VitisAIExecutionProvider": "onnxruntime",
     "WebGpuExecutionProvider": "onnxruntime",
     "NvTensorRTRTXExecutionProvider": "onnxruntime-gpu",
@@ -526,93 +526,6 @@ async def diffusion_lora(
 
 
 @mcp.tool()
-async def generate_adapter(
-    model_name_or_path: str,
-    ctx: Context[ServerSession, None],
-    adapter_type: str = "LoRA",
-    adapter_format: str = "onnx_adapter",
-    output_path: str | None = None,
-) -> dict:
-    """Generate ONNX model with adapters as inputs. Only accepts ONNX models.
-
-    Args:
-        model_name_or_path: Path to ONNX model.
-        adapter_type: Type of adapter - "LoRA". Default: LoRA.
-        adapter_format: Format to save weights - "onnx_adapter", "safetensors", "npz".
-        output_path: Directory to save output. Auto-generated if omitted.
-    """
-    if not output_path:
-        output_path = _make_output_path("generate_adapter", model_name_or_path)
-
-    kwargs = _build_kwargs(
-        model_name_or_path=model_name_or_path,
-        adapter_type=adapter_type,
-        adapter_format=adapter_format,
-        output_path=output_path,
-    )
-    return await _run_olive("generate_adapter", kwargs, ["onnxruntime"], ctx)
-
-
-@mcp.tool()
-async def convert_adapters(
-    adapter_path: str,
-    output_path: str,
-    ctx: Context[ServerSession, None],
-    adapter_format: str = "onnx_adapter",
-    dtype: str = "float32",
-    quantize_int4: bool = False,
-    int4_block_size: int = 32,
-    int4_quantization_mode: str = "symmetric",
-) -> dict:
-    """Convert LoRA adapter weights to a format consumable by ONNX models.
-
-    Args:
-        adapter_path: Path to adapter weights (local folder or HuggingFace ID).
-        output_path: Path to save exported weights.
-        adapter_format: Format - "onnx_adapter", "safetensors", "npz".
-        dtype: Data type - "float32" or "float16".
-        quantize_int4: Quantize adapter weights to int4.
-        int4_block_size: Block size for int4 quantization (16/32/64/128/256).
-        int4_quantization_mode: Mode - "symmetric" or "asymmetric".
-    """
-    kwargs = _build_kwargs(
-        adapter_path=adapter_path,
-        output_path=output_path,
-        adapter_format=adapter_format,
-        dtype=dtype,
-        quantize_int4=quantize_int4 if quantize_int4 else None,
-        int4_block_size=int4_block_size,
-        int4_quantization_mode=int4_quantization_mode,
-    )
-    return await _run_olive("convert_adapters", kwargs, ["onnxruntime"], ctx)
-
-
-@mcp.tool()
-async def extract_adapters(
-    model_name_or_path: str,
-    format: str,
-    output: str,
-    ctx: Context[ServerSession, None],
-    dtype: str = "float32",
-) -> dict:
-    """Extract LoRA adapters from a PyTorch model to separate files.
-
-    Args:
-        model_name_or_path: Path to PyTorch model (local folder or HuggingFace ID).
-        format: Format to save LoRAs - "onnx_adapter", "safetensors", "npz".
-        output: Output folder to save the LoRAs.
-        dtype: Data type - "float32" or "float16".
-    """
-    kwargs = _build_kwargs(
-        model_name_or_path=model_name_or_path,
-        format=format,
-        output=output,
-        dtype=dtype,
-    )
-    return await _run_olive("extract_adapters", kwargs, [], ctx)
-
-
-@mcp.tool()
 async def tune_session_params(
     model_name_or_path: str,
     ctx: Context[ServerSession, None],
@@ -641,52 +554,6 @@ async def tune_session_params(
         output_path=output_path,
     )
     return await _run_olive("tune_session_params", kwargs, ["onnxruntime"], ctx)
-
-
-@mcp.tool()
-async def generate_cost_model(
-    model_name_or_path: str,
-    ctx: Context[ServerSession, None],
-    weight_precision: str = "fp16",
-    output_path: str | None = None,
-) -> dict:
-    """Generate a cost model for model splitting (HuggingFace models only).
-
-    The cost model is saved as a CSV file consumed by the CaptureSplitInfo pass.
-
-    Args:
-        model_name_or_path: HuggingFace model name or local path.
-        weight_precision: Weight precision for cost estimation - "fp32", "fp16", "int4", etc.
-        output_path: Path to save cost model CSV. Auto-generated if omitted.
-    """
-    if not output_path:
-        output_path = _make_output_path("cost_model", model_name_or_path)
-
-    kwargs = _build_kwargs(
-        model_name_or_path=model_name_or_path,
-        weight_precision=weight_precision,
-        output_path=output_path,
-    )
-    return await _run_olive("generate_cost_model", kwargs, [], ctx)
-
-
-@mcp.tool()
-async def run_workflow(
-    run_config: str,
-    ctx: Context[ServerSession, None],
-    output_path: str | None = None,
-) -> dict:
-    """Run a custom Olive workflow from a JSON config file.
-
-    Args:
-        run_config: Path to Olive workflow config JSON file.
-        output_path: Directory to save results. Uses config default if omitted.
-    """
-    kwargs = _build_kwargs(
-        run_config=run_config,
-        output_path=output_path,
-    )
-    return await _run_olive("run", kwargs, ["onnxruntime"], ctx)
 
 
 @mcp.tool()
