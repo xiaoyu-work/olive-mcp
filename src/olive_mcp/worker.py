@@ -78,6 +78,10 @@ def main():
         if func is None:
             result = {"status": "error", "error": f"Unknown command: {command}"}
         else:
+            # Default log_level to 1 (INFO) so olive outputs progress to stderr.
+            # Olive default is 3 (ERROR) which hides almost everything.
+            # 0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR, 4=CRITICAL
+            kwargs.setdefault("log_level", 1)
             workflow_output = func(**kwargs)
             result = serialize_workflow_output(workflow_output)
 

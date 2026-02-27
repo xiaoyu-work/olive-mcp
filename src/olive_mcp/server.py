@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import sys
 import uuid
 from datetime import datetime
@@ -21,19 +22,35 @@ You MUST then poll `get_job_status(job_id)` to check progress and get results.
 **Workflow for every optimization task:**
 1. Call the tool (e.g. `optimize`) → returns `{"job_id": "xxx", "status": "running"}`
 2. Tell the user "Optimization started, checking progress..."
-3. Call `get_job_status("xxx")` → returns current status + recent log lines
-4. If status is "running", show the user the latest logs and call `get_job_status` again
-5. Keep polling until status is "completed" or "error"
-6. Show the user the final result (model path, metrics, etc.)
+3. Call `get_job_status("xxx")` → returns current status + recent olive log lines
+4. **ALWAYS show the user the `recent_logs` content** — this is the real olive output, the user wants to see it
+5. If status is "running", summarize what olive is doing based on the logs, then call `get_job_status` again
+6. Keep polling until status is "completed" or "error"
+7. Show the user the final result (model path, metrics, etc.)
 
-**You MUST poll `get_job_status` repeatedly (every call) until the job finishes. Do NOT stop polling while status is "running".**
+**IMPORTANT: Always display the recent_logs to the user so they can see olive's progress. Do NOT silently poll without showing logs.**
+**Optimization can take 5-30+ minutes depending on model size. This is normal.**
 
-## Choosing parameters based on user intent
-- **Smallest model / fastest inference / edge deployment** → precision="int4", algorithm="gptq" or "awq"
-- **Balanced size and quality** → precision="int8"
-- **Best quality / minimal degradation** → precision="fp16"
-- **Training / fine-tuning** → suggest `finetune` with method="qlora" (less memory) or "lora"
-- **Just convert to ONNX** → use `capture_onnx_graph`
+## HuggingFace authentication
+Some models (e.g. gated models like meta-llama) require a HuggingFace token to download.
+- If a job fails with errors mentioning "401", "403", "authentication", "gated", or "Access denied", **ask the user for their HuggingFace token** and retry with the `hf_token` parameter.
+- You can get a token from https://huggingface.co/settings/tokens
+- The token is passed as an environment variable to the worker process and is NOT stored anywhere.
+
+## Choosing the right tool and parameters
+
+### IMPORTANT: optimize vs quantize for int4
+- `optimize` with int4 precision **always runs GPTQ calibration**, which is VERY SLOW on CPU (30min+ for small models).
+- For **fast int4 quantization on CPU**, use `quantize` with `algorithm="rtn"` instead. RTN is minutes vs hours.
+- Only recommend `optimize` + int4 when the user has a GPU and wants best quality, or is willing to wait.
+- For CPU users wanting int4: suggest `quantize(algorithm="rtn", precision="int4")` first, then optionally `optimize` with fp16 for graph optimizations.
+
+### User intent → tool choice
+- **Smallest model / fast inference** → `quantize` with precision="int4", algorithm="rtn" (fast) or "gptq" (slow but better quality)
+- **Balanced size and quality** → `quantize` with precision="int8"
+- **Best quality / minimal degradation** → `optimize` with precision="fp16"
+- **Training / fine-tuning** → `finetune` with method="qlora" (less memory) or "lora"
+- **Just convert to ONNX** → `capture_onnx_graph`
 - **Deploy to specific hardware** → match provider: GPU→CUDAExecutionProvider, NPU→QNNExecutionProvider, DirectML→DmlExecutionProvider
 
 ## Popular model recommendations
@@ -52,6 +69,9 @@ You MUST then poll `get_job_status(job_id)` to check progress and get results.
 VENV_BASE = Path.home() / ".olive-mcp" / "venvs"
 OUTPUT_BASE = Path.home() / ".olive-mcp" / "outputs"
 WORKER_PATH = Path(__file__).parent / "worker.py"
+
+# Bump this when _resolve_packages logic changes to invalidate stale cached venvs.
+_VENV_CACHE_VERSION = "v2"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -112,6 +132,7 @@ def _resolve_packages(command: str, provider: str | None = None, **kwargs) -> li
 
     Uses olive-ai[extras] syntax to pull in the right onnxruntime variant,
     plus any additional packages that specific passes/commands require.
+    Includes hidden/implicit dependencies that olive_config.json doesn't declare.
     """
     extras = set()
     extra_packages = []
@@ -124,13 +145,19 @@ def _resolve_packages(command: str, provider: str | None = None, **kwargs) -> li
 
     # 2. Command-specific extras
     if command == "optimize":
-        # Default exporter is model_builder → needs onnxruntime-genai
         exporter = kwargs.get("exporter") or "model_builder"
-        if exporter == "model_builder" and provider:
-            genai_pkg = PROVIDER_TO_GENAI.get(provider, "onnxruntime-genai")
+        precision = kwargs.get("precision", "fp32")
+
+        if exporter == "model_builder":
+            # ModelBuilder pass requires onnxruntime-genai (undeclared in olive_config.json)
+            genai_pkg = PROVIDER_TO_GENAI.get(provider or "CPUExecutionProvider", "onnxruntime-genai")
             extra_packages.append(genai_pkg)
         elif exporter == "optimum_exporter":
             extras.add("optimum")
+
+        # GPTQ pass is enabled for int4/uint4 precision → needs calibration data → datasets
+        if precision in ("int4", "uint4"):
+            extra_packages.append("datasets")
 
     elif command == "quantize":
         algorithm = kwargs.get("algorithm", "rtn")
@@ -140,9 +167,12 @@ def _resolve_packages(command: str, provider: str | None = None, **kwargs) -> li
         elif impl == "inc":
             extras.add("inc")
         elif impl == "autogptq" or algorithm == "gptq":
-            extra_packages.extend(["auto-gptq", "optimum"])
+            extra_packages.extend(["auto-gptq", "optimum", "datasets"])
         elif impl == "awq" or algorithm == "awq":
             extra_packages.append("autoawq")
+        # Static quantization needs calibration data
+        if algorithm != "rtn":
+            extra_packages.append("datasets")
 
     elif command == "finetune":
         method = kwargs.get("method", "lora")
@@ -150,9 +180,15 @@ def _resolve_packages(command: str, provider: str | None = None, **kwargs) -> li
             extras.add("finetune")  # includes bnb, peft, accelerate, etc.
         else:
             extras.add("lora")  # peft, accelerate, scipy
+        # Fine-tuning always loads datasets
+        extra_packages.append("datasets")
 
     elif command == "capture_onnx_graph":
-        extras.add("capture-onnx-graph")  # optimum
+        extras.add("capture-onnx-graph")  # optimum only — does NOT include onnxruntime
+        # Model builder variant for capture
+        if kwargs.get("use_model_builder"):
+            genai_pkg = PROVIDER_TO_GENAI.get(provider or "CPUExecutionProvider", "onnxruntime-genai")
+            extra_packages.append(genai_pkg)
 
     elif command == "benchmark":
         device = kwargs.get("device", "cpu")
@@ -160,20 +196,36 @@ def _resolve_packages(command: str, provider: str | None = None, **kwargs) -> li
             extras.add("gpu")
         else:
             extras.add("cpu")
+        # lm-eval is the evaluation backend
+        extra_packages.extend(["lm_eval", "datasets"])
 
     elif command == "tune_session_params":
         extras.add("tune-session-params")  # psutil
 
     elif command == "diffusion_lora":
         extras.add("diffusers")  # accelerate, peft, diffusers
+        extra_packages.append("datasets")
 
-    # Build olive-ai install string
-    if extras:
-        olive_install = f"olive-ai[{','.join(sorted(extras))}]"
-    else:
-        olive_install = "olive-ai"
+    # 3. Ensure a base onnxruntime is always present.
+    #    Many olive passes need onnxruntime at runtime even if they don't declare it.
+    #    The extras "cpu", "gpu", "directml", etc. each install the right ORT variant.
+    #    If none was added yet, default to "cpu" so bare onnxruntime is available.
+    ORT_EXTRAS = {"cpu", "gpu", "directml", "openvino", "qnn"}
+    if not extras.intersection(ORT_EXTRAS):
+        extras.add("cpu")
 
-    return [olive_install] + extra_packages
+    # 4. Build olive-ai install string with extras
+    olive_install = f"olive-ai[{','.join(sorted(extras))}]"
+
+    # 5. Deduplicate extra_packages
+    seen = set()
+    deduped = []
+    for pkg in extra_packages:
+        if pkg not in seen:
+            seen.add(pkg)
+            deduped.append(pkg)
+
+    return [olive_install] + deduped
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +253,7 @@ def _job_log(job_id: str, line: str):
     """Append a log line to a job."""
     if job_id in _jobs:
         _jobs[job_id]["log_lines"].append(line)
+        _jobs[job_id]["last_activity"] = datetime.now().isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +287,7 @@ def _build_kwargs(**kw) -> dict:
 
 async def _get_or_create_venv(packages: list[str], job_id: str) -> Path:
     """Get or create a cached uv venv with the specified packages."""
-    key = hashlib.md5("|".join(sorted(packages)).encode()).hexdigest()[:12]
+    key = hashlib.md5(f"{_VENV_CACHE_VERSION}|{'|'.join(sorted(packages))}".encode()).hexdigest()[:12]
     venv_path = VENV_BASE / key
     python_path = _get_python_path(venv_path)
 
@@ -273,26 +326,12 @@ async def _get_or_create_venv(packages: list[str], job_id: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
-_INTERESTING_KEYWORDS = [
-    "Running pass", "Pass ", "Downloading", "Loading", "Evaluating",
-    "Saving", "Model is saved", "Exporting", "Converting", "Quantizing",
-    "Optimizing", "Training", "Step ", "Epoch ", "loss", "accuracy",
-    "latency", "throughput", "WARNING", "ERROR", "Exception", "No output model",
-]
-
-
-def _is_interesting_line(line: str) -> bool:
-    """Filter out noisy log lines, keep only meaningful progress updates."""
-    if not line.strip():
-        return False
-    return any(kw in line for kw in _INTERESTING_KEYWORDS)
-
-
 async def _run_olive_background(
     job_id: str,
     command: str,
     kwargs: dict,
     packages: list[str],
+    hf_token: str | None = None,
 ):
     """Background task: run olive in isolated venv, stream logs to job."""
     try:
@@ -303,19 +342,34 @@ async def _run_olive_background(
         _jobs[job_id]["status"] = "running"
         _job_log(job_id, f"Running: olive {command}")
 
+        # Pass HF token via environment variable (not in kwargs — olive API doesn't take it)
+        env = os.environ.copy()
+        if hf_token:
+            env["HF_TOKEN"] = hf_token
+            _job_log(job_id, "HuggingFace token provided")
+
         proc = await asyncio.create_subprocess_exec(
             str(python_path), "-u", str(WORKER_PATH), command, json.dumps(kwargs),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
+            limit=10 * 1024 * 1024,  # 10 MB line limit (default 64KB is too small for olive output)
         )
 
-        # Stream stderr (olive logs) line by line into job log
+        # Stream ALL stderr (olive logs) directly into job log
         while True:
-            line = await proc.stderr.readline()
+            try:
+                line = await proc.stderr.readline()
+            except ValueError:
+                # Line exceeded even the 10MB limit — skip it
+                continue
             if not line:
                 break
             decoded = line.decode("utf-8", errors="replace").rstrip()
-            if _is_interesting_line(decoded):
+            if decoded:
+                # Truncate extremely long lines for display (e.g. base64 blobs)
+                if len(decoded) > 500:
+                    decoded = decoded[:500] + "... (truncated)"
                 _job_log(job_id, decoded)
 
         # Read stdout (JSON result)
@@ -347,12 +401,12 @@ async def _run_olive_background(
         _job_log(job_id, f"Exception: {exc}")
 
 
-def _start_job(command: str, description: str, kwargs: dict) -> dict:
+def _start_job(command: str, description: str, kwargs: dict, hf_token: str | None = None) -> dict:
     """Create a job, resolve packages, launch background task, return immediately."""
     job_id = _create_job(command, description)
     packages = _resolve_packages(command, **kwargs)
     asyncio.get_event_loop().create_task(
-        _run_olive_background(job_id, command, kwargs, packages)
+        _run_olive_background(job_id, command, kwargs, packages, hf_token=hf_token)
     )
     return {
         "job_id": job_id,
@@ -384,27 +438,55 @@ async def list_supported_configs() -> dict:
 
 
 @mcp.tool()
-async def get_job_status(job_id: str, last_n_logs: int = 20) -> dict:
-    """Check the status and progress of a background job.
+async def get_job_status(job_id: str, last_n_logs: int = 50) -> dict:
+    """Check the status and progress of a background job (long-poll).
 
-    Call this repeatedly after starting an optimization/quantization/finetune job.
-    Each call returns the latest log lines so you can report progress to the user.
-    Keep calling until status is "completed" or "error".
+    This tool **blocks up to 30 seconds** waiting for new olive log output.
+    It returns immediately when:
+    - New log lines arrive from olive
+    - The job completes or errors
+    - 30 seconds pass with no new output (returns anyway so you know it's still alive)
+
+    Just call this in a simple loop. Do NOT add any delay — the tool handles timing internally.
+
+    **Show `recent_logs` and `new_lines` to the user every time.** If `new_lines` is 0 and
+    `seconds_since_last_output` keeps growing, warn the user the process may be stuck.
 
     Args:
         job_id: The job ID returned by optimize/quantize/finetune/etc.
-        last_n_logs: Number of recent log lines to return. Default: 20.
+        last_n_logs: Number of recent log lines to return. Default: 50.
     """
     if job_id not in _jobs:
         return {"status": "not_found", "error": f"No job with id '{job_id}'"}
 
     job = _jobs[job_id]
+
+    # Long-poll: wait up to 30 seconds for new logs or job completion.
+    new_lines = 0
+    if job["status"] in ("starting", "setting_up", "running"):
+        prev_count = len(job["log_lines"])
+        for _ in range(60):  # 60 x 0.5s = 30 seconds max
+            await asyncio.sleep(0.5)
+            if job["status"] not in ("starting", "setting_up", "running"):
+                break  # job finished
+            if len(job["log_lines"]) > prev_count:
+                # New logs arrived — wait a tiny bit more to batch them, then return
+                await asyncio.sleep(0.5)
+                break
+        new_lines = len(job["log_lines"]) - prev_count
+
+    now = datetime.now()
+    started = datetime.fromisoformat(job["started_at"])
+    last_activity = datetime.fromisoformat(job.get("last_activity", job["started_at"]))
+
     response = {
         "job_id": job_id,
         "status": job["status"],
         "command": job["command"],
         "description": job["description"],
-        "started_at": job["started_at"],
+        "elapsed": str(now - started).split(".")[0],  # e.g. "0:05:23"
+        "seconds_since_last_output": int((now - last_activity).total_seconds()),
+        "new_lines": new_lines,
         "recent_logs": job["log_lines"][-last_n_logs:],
         "total_log_lines": len(job["log_lines"]),
     }
@@ -429,6 +511,7 @@ async def optimize(
     block_size: int | None = None,
     surgeries: list[str] | None = None,
     output_path: str | None = None,
+    hf_token: str | None = None,
 ) -> dict:
     """Optimize a model end-to-end. Returns a job_id — use get_job_status() to poll progress.
 
@@ -445,6 +528,7 @@ async def optimize(
         block_size: Block size for quantization (-1 for per-channel).
         surgeries: List of graph surgeries to apply.
         output_path: Directory to save optimized model. Auto-generated if omitted.
+        hf_token: HuggingFace token for gated/private models. Ask the user if download fails with 401/403.
     """
     if not output_path:
         output_path = _make_output_path("optimize", model_name_or_path)
@@ -463,7 +547,7 @@ async def optimize(
         surgeries=surgeries,
         output_path=output_path,
     )
-    return _start_job("optimize", f"Optimize {model_name_or_path} ({precision}, {provider})", kwargs)
+    return _start_job("optimize", f"Optimize {model_name_or_path} ({precision}, {provider})", kwargs, hf_token=hf_token)
 
 
 @mcp.tool()
@@ -476,6 +560,7 @@ async def quantize(
     use_qdq_encoding: bool = False,
     data_name: str | None = None,
     output_path: str | None = None,
+    hf_token: str | None = None,
 ) -> dict:
     """Quantize a model. Returns a job_id — use get_job_status() to poll progress.
 
@@ -488,6 +573,7 @@ async def quantize(
         use_qdq_encoding: Use QDQ encoding in ONNX model.
         data_name: HuggingFace dataset name for calibration (required by some algorithms).
         output_path: Directory to save quantized model. Auto-generated if omitted.
+        hf_token: HuggingFace token for gated/private models. Ask the user if download fails with 401/403.
     """
     if not output_path:
         output_path = _make_output_path("quantize", model_name_or_path)
@@ -502,7 +588,7 @@ async def quantize(
         data_name=data_name,
         output_path=output_path,
     )
-    return _start_job("quantize", f"Quantize {model_name_or_path} ({algorithm}, {precision})", kwargs)
+    return _start_job("quantize", f"Quantize {model_name_or_path} ({algorithm}, {precision})", kwargs, hf_token=hf_token)
 
 
 @mcp.tool()
@@ -517,6 +603,7 @@ async def finetune(
     train_split: str = "train",
     eval_split: str | None = None,
     output_path: str | None = None,
+    hf_token: str | None = None,
 ) -> dict:
     """Fine-tune a model using LoRA or QLoRA. Returns a job_id — use get_job_status() to poll.
 
@@ -531,6 +618,7 @@ async def finetune(
         train_split: Dataset split for training. Default: "train".
         eval_split: Dataset split for evaluation (optional).
         output_path: Directory to save fine-tuned adapter. Auto-generated if omitted.
+        hf_token: HuggingFace token for gated/private models. Ask the user if download fails with 401/403.
     """
     if not output_path:
         output_path = _make_output_path("finetune", model_name_or_path)
@@ -547,7 +635,7 @@ async def finetune(
         eval_split=eval_split,
         output_path=output_path,
     )
-    return _start_job("finetune", f"Finetune {model_name_or_path} ({method}) on {data_name}", kwargs)
+    return _start_job("finetune", f"Finetune {model_name_or_path} ({method}) on {data_name}", kwargs, hf_token=hf_token)
 
 
 @mcp.tool()
@@ -561,6 +649,7 @@ async def capture_onnx_graph(
     target_opset: int = 20,
     use_ort_genai: bool = False,
     output_path: str | None = None,
+    hf_token: str | None = None,
 ) -> dict:
     """Capture ONNX graph from a model. Returns a job_id — use get_job_status() to poll.
 
@@ -574,6 +663,7 @@ async def capture_onnx_graph(
         target_opset: Target ONNX opset version. Default: 20.
         use_ort_genai: Use ORT generate() API to run the model.
         output_path: Directory to save ONNX model. Auto-generated if omitted.
+        hf_token: HuggingFace token for gated/private models. Ask the user if download fails with 401/403.
     """
     if not output_path:
         output_path = _make_output_path("capture", model_name_or_path)
@@ -589,7 +679,7 @@ async def capture_onnx_graph(
         use_ort_genai=use_ort_genai if use_ort_genai else None,
         output_path=output_path,
     )
-    return _start_job("capture_onnx_graph", f"Capture ONNX from {model_name_or_path}", kwargs)
+    return _start_job("capture_onnx_graph", f"Capture ONNX from {model_name_or_path}", kwargs, hf_token=hf_token)
 
 
 @mcp.tool()
@@ -601,6 +691,7 @@ async def benchmark(
     max_length: int = 1024,
     limit: float = 1.0,
     output_path: str | None = None,
+    hf_token: str | None = None,
 ) -> dict:
     """Benchmark/evaluate a model. Returns a job_id — use get_job_status() to poll.
 
@@ -612,6 +703,7 @@ async def benchmark(
         max_length: Maximum length of input + output. Default: 1024.
         limit: Fraction of samples (0.0-1.0) or absolute number. Default: 1.0.
         output_path: Directory to save results. Auto-generated if omitted.
+        hf_token: HuggingFace token for gated/private models. Ask the user if download fails with 401/403.
     """
     if not tasks:
         tasks = ["hellaswag"]
@@ -627,7 +719,7 @@ async def benchmark(
         limit=limit,
         output_path=output_path,
     )
-    return _start_job("benchmark", f"Benchmark {model_name_or_path} on {', '.join(tasks)}", kwargs)
+    return _start_job("benchmark", f"Benchmark {model_name_or_path} on {', '.join(tasks)}", kwargs, hf_token=hf_token)
 
 
 @mcp.tool()
@@ -646,6 +738,7 @@ async def diffusion_lora(
     instance_prompt: str | None = None,
     merge_lora: bool = False,
     output_path: str | None = None,
+    hf_token: str | None = None,
 ) -> dict:
     """Train LoRA for diffusion models. Returns a job_id — use get_job_status() to poll.
 
@@ -664,6 +757,7 @@ async def diffusion_lora(
         instance_prompt: Fixed prompt for DreamBooth mode.
         merge_lora: Merge LoRA into base model instead of saving adapter only.
         output_path: Directory to save LoRA adapter. Auto-generated if omitted.
+        hf_token: HuggingFace token for gated/private models. Ask the user if download fails with 401/403.
     """
     if not output_path:
         output_path = _make_output_path("diffusion_lora", model_name_or_path)
@@ -684,7 +778,7 @@ async def diffusion_lora(
         merge_lora=merge_lora if merge_lora else None,
         output_path=output_path,
     )
-    return _start_job("diffusion_lora", f"Diffusion LoRA for {model_name_or_path}", kwargs)
+    return _start_job("diffusion_lora", f"Diffusion LoRA for {model_name_or_path}", kwargs, hf_token=hf_token)
 
 
 @mcp.tool()
