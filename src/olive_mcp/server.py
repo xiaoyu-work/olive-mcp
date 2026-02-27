@@ -23,11 +23,26 @@ When the user describes their goal instead of specific parameters, choose accord
 - **Just convert to ONNX** → use `capture_onnx_graph`
 - **Deploy to specific hardware** → match provider: GPU→CUDAExecutionProvider, NPU→QNNExecutionProvider, DirectML→DmlExecutionProvider
 
+## Popular model recommendations
+When the user doesn't specify a model, suggest based on their use case:
+- **Text chat / general LLM**: microsoft/Phi-4-mini-instruct (small, fast), microsoft/Phi-4 (powerful)
+- **Code generation**: microsoft/Phi-4-mini-instruct
+- **Image generation**: runwayml/stable-diffusion-v1-5 (SD 1.5), stabilityai/stable-diffusion-xl-base-1.0 (SDXL), black-forest-labs/FLUX.1-dev (Flux)
+- **Embedding / retrieval**: BAAI/bge-small-en-v1.5, sentence-transformers/all-MiniLM-L6-v2
+- **Vision + language**: microsoft/Phi-4-multimodal-instruct
+
 ## Workflow
-1. If unsure about options, call `list_supported_configs` first.
+1. If the user is a beginner or unsure, ask what they want to achieve (chat, code, images, etc.) and recommend a model + settings.
 2. For most optimization tasks, `optimize` is the recommended starting point — it auto-selects the best passes.
 3. Use `quantize` only when the user wants fine-grained control over quantization algorithm/implementation.
-4. After optimization, suggest `benchmark` to evaluate quality.
+4. After optimization, suggest `benchmark` to evaluate quality, or use `list_outputs` to review past results.
+5. When the user asks to compare results, use `list_outputs` to find previous runs.
+
+## Multi-step workflow guidance
+- **Full pipeline**: optimize → benchmark → compare with original
+- **Fine-tune then deploy**: finetune → optimize (with the fine-tuned model) → benchmark
+- **Diffusion LoRA**: diffusion_lora → convert_adapters (if ONNX deployment needed)
+- **ONNX deployment**: capture_onnx_graph → tune_session_params → benchmark
 """,
 )
 
@@ -672,3 +687,140 @@ async def run_workflow(
         output_path=output_path,
     )
     return await _run_olive("run", kwargs, ["onnxruntime"], ctx)
+
+
+@mcp.tool()
+async def list_outputs(
+    prefix: str | None = None,
+    limit: int = 20,
+) -> dict:
+    """List previous optimization outputs saved by olive-mcp.
+
+    Use this to review past results, find model paths, or compare runs.
+
+    Args:
+        prefix: Filter by operation type (e.g. "optimize", "quantize", "finetune"). Show all if omitted.
+        limit: Maximum number of results to return. Default: 20.
+    """
+    if not OUTPUT_BASE.exists():
+        return {"outputs": [], "message": "No outputs found. Run an optimization first."}
+
+    entries = []
+    for d in sorted(OUTPUT_BASE.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        if not d.is_dir():
+            continue
+        if prefix and not d.name.startswith(prefix):
+            continue
+
+        entry = {"name": d.name, "path": str(d)}
+
+        # Extract timestamp from dir name
+        parts = d.name.rsplit("_", 2)
+        if len(parts) >= 3:
+            entry["operation"] = parts[0]
+            entry["timestamp"] = f"{parts[-2]}_{parts[-1]}"
+
+        # Find model files
+        for ext in ("*.onnx", "*.pt", "*.safetensors", "*.bin"):
+            files = list(d.rglob(ext))
+            if files:
+                entry["model_files"] = [str(f) for f in files[:5]]
+                break
+
+        # Check for config
+        for cfg_name in ("model_config.json", "config.json", "inference_config.json"):
+            cfg = d / cfg_name
+            if cfg.exists():
+                entry["has_config"] = True
+                break
+
+        entries.append(entry)
+        if len(entries) >= limit:
+            break
+
+    return {"outputs": entries, "total": len(entries)}
+
+
+# ---------------------------------------------------------------------------
+# MCP Prompts — guided workflows for beginners
+# ---------------------------------------------------------------------------
+
+
+@mcp.prompt(
+    name="optimize-model",
+    description="Guided model optimization — helps you choose the right model, precision, and target device.",
+)
+def prompt_optimize_model() -> list[dict]:
+    return [
+        {
+            "role": "user",
+            "content": (
+                "I want to optimize a model using Olive. Help me step by step:\n"
+                "1. Ask what I want to use the model for (chat, code, images, etc.)\n"
+                "2. Ask about my target device (CPU, GPU, NPU) and any size/speed/quality preference\n"
+                "3. Recommend a model and optimization settings based on my answers\n"
+                "4. Run the optimization with the `optimize` tool\n"
+                "5. Show me the results and suggest next steps (benchmark, deploy, etc.)"
+            ),
+        }
+    ]
+
+
+@mcp.prompt(
+    name="quantize-model",
+    description="Guided model quantization — helps you choose precision and algorithm.",
+)
+def prompt_quantize_model() -> list[dict]:
+    return [
+        {
+            "role": "user",
+            "content": (
+                "I want to quantize a model to make it smaller/faster. Help me:\n"
+                "1. Ask which model I want to quantize (or recommend one for my use case)\n"
+                "2. Ask about my priority: smallest size, best quality, or balanced\n"
+                "3. Choose the right precision and algorithm based on my answers\n"
+                "4. Run the quantization with the `quantize` tool\n"
+                "5. Show me the results (size reduction, etc.)"
+            ),
+        }
+    ]
+
+
+@mcp.prompt(
+    name="finetune-model",
+    description="Guided model fine-tuning — helps you set up LoRA/QLoRA training.",
+)
+def prompt_finetune_model() -> list[dict]:
+    return [
+        {
+            "role": "user",
+            "content": (
+                "I want to fine-tune a model on my own data. Help me:\n"
+                "1. Ask what task I want the model to learn\n"
+                "2. Ask about my training data (HuggingFace dataset name or local path)\n"
+                "3. Ask about my GPU memory to decide between LoRA and QLoRA\n"
+                "4. Recommend a base model and training settings\n"
+                "5. Run fine-tuning with the `finetune` tool\n"
+                "6. Suggest next steps (optimize the fine-tuned model, benchmark, etc.)"
+            ),
+        }
+    ]
+
+
+@mcp.prompt(
+    name="compare-models",
+    description="Compare previous optimization results — find the best model from past runs.",
+)
+def prompt_compare_models() -> list[dict]:
+    return [
+        {
+            "role": "user",
+            "content": (
+                "I want to compare my previous optimization results. Help me:\n"
+                "1. Use `list_outputs` to show my past optimization runs\n"
+                "2. Summarize each run (model, precision, size, metrics if available)\n"
+                "3. Recommend which result is best for my needs\n"
+                "4. If I haven't benchmarked yet, suggest running `benchmark` on the candidates"
+            ),
+        }
+    ]
