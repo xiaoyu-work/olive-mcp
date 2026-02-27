@@ -347,10 +347,10 @@ async def _run_olive_background(
         _job_log(job_id, f"Exception: {exc}")
 
 
-def _start_job(command: str, description: str, kwargs: dict, provider: str | None = None) -> dict:
+def _start_job(command: str, description: str, kwargs: dict) -> dict:
     """Create a job, resolve packages, launch background task, return immediately."""
     job_id = _create_job(command, description)
-    packages = _resolve_packages(command, provider=provider, **kwargs)
+    packages = _resolve_packages(command, **kwargs)
     asyncio.get_event_loop().create_task(
         _run_olive_background(job_id, command, kwargs, packages)
     )
@@ -463,7 +463,7 @@ async def optimize(
         surgeries=surgeries,
         output_path=output_path,
     )
-    return _start_job("optimize", f"Optimize {model_name_or_path} ({precision}, {provider})", kwargs, provider=provider)
+    return _start_job("optimize", f"Optimize {model_name_or_path} ({precision}, {provider})", kwargs)
 
 
 @mcp.tool()
