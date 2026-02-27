@@ -4,18 +4,31 @@ import asyncio
 import hashlib
 import json
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 
-from mcp.server.fastmcp import Context, FastMCP
-from mcp.server.session import ServerSession
+from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP(
     name="olive",
     instructions="""Olive MCP server for Microsoft Olive model optimization.
 
+## IMPORTANT: Async job pattern
+All long-running tools (optimize, quantize, finetune, etc.) run in the background and return a `job_id` immediately.
+You MUST then poll `get_job_status(job_id)` to check progress and get results.
+
+**Workflow for every optimization task:**
+1. Call the tool (e.g. `optimize`) → returns `{"job_id": "xxx", "status": "running"}`
+2. Tell the user "Optimization started, checking progress..."
+3. Call `get_job_status("xxx")` → returns current status + recent log lines
+4. If status is "running", show the user the latest logs and call `get_job_status` again
+5. Keep polling until status is "completed" or "error"
+6. Show the user the final result (model path, metrics, etc.)
+
+**You MUST poll `get_job_status` repeatedly (every call) until the job finishes. Do NOT stop polling while status is "running".**
+
 ## Choosing parameters based on user intent
-When the user describes their goal instead of specific parameters, choose accordingly:
 - **Smallest model / fastest inference / edge deployment** → precision="int4", algorithm="gptq" or "awq"
 - **Balanced size and quality** → precision="int8"
 - **Best quality / minimal degradation** → precision="fp16"
@@ -24,25 +37,11 @@ When the user describes their goal instead of specific parameters, choose accord
 - **Deploy to specific hardware** → match provider: GPU→CUDAExecutionProvider, NPU→QNNExecutionProvider, DirectML→DmlExecutionProvider
 
 ## Popular model recommendations
-When the user doesn't specify a model, suggest based on their use case:
 - **Text chat / general LLM**: microsoft/Phi-4-mini-instruct (small, fast), microsoft/Phi-4 (powerful)
 - **Code generation**: microsoft/Phi-4-mini-instruct
-- **Image generation**: runwayml/stable-diffusion-v1-5 (SD 1.5), stabilityai/stable-diffusion-xl-base-1.0 (SDXL), black-forest-labs/FLUX.1-dev (Flux)
+- **Image generation**: runwayml/stable-diffusion-v1-5 (SD 1.5), stabilityai/stable-diffusion-xl-base-1.0 (SDXL)
 - **Embedding / retrieval**: BAAI/bge-small-en-v1.5, sentence-transformers/all-MiniLM-L6-v2
 - **Vision + language**: microsoft/Phi-4-multimodal-instruct
-
-## Workflow
-1. If the user is a beginner or unsure, ask what they want to achieve (chat, code, images, etc.) and recommend a model + settings.
-2. For most optimization tasks, `optimize` is the recommended starting point — it auto-selects the best passes.
-3. Use `quantize` only when the user wants fine-grained control over quantization algorithm/implementation.
-4. After optimization, suggest `benchmark` to evaluate quality, or use `list_outputs` to review past results.
-5. When the user asks to compare results, use `list_outputs` to find previous runs.
-
-## Multi-step workflow guidance
-- **Full pipeline**: optimize → benchmark → compare with original
-- **Fine-tune then deploy**: finetune → optimize (with the fine-tuned model) → benchmark
-- **Diffusion LoRA**: diffusion_lora → optimize (for deployment)
-- **ONNX deployment**: capture_onnx_graph → tune_session_params → benchmark
 """,
 )
 
@@ -106,6 +105,33 @@ DEVICE_TO_DEFAULT_PROVIDER = {
 
 
 # ---------------------------------------------------------------------------
+# Job tracking
+# ---------------------------------------------------------------------------
+
+_jobs: dict[str, dict] = {}
+
+
+def _create_job(command: str, description: str) -> str:
+    """Create a new background job and return its ID."""
+    job_id = uuid.uuid4().hex[:8]
+    _jobs[job_id] = {
+        "status": "starting",
+        "command": command,
+        "description": description,
+        "log_lines": [],
+        "result": None,
+        "started_at": datetime.now().isoformat(),
+    }
+    return job_id
+
+
+def _job_log(job_id: str, line: str):
+    """Append a log line to a job."""
+    if job_id in _jobs:
+        _jobs[job_id]["log_lines"].append(line)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -134,17 +160,14 @@ def _build_kwargs(**kw) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def _get_or_create_venv(
-    packages: list[str],
-    ctx: Context[ServerSession, None],
-) -> Path:
+async def _get_or_create_venv(packages: list[str], job_id: str) -> Path:
     """Get or create a cached uv venv with the specified packages."""
     key = hashlib.md5("|".join(sorted(packages)).encode()).hexdigest()[:12]
     venv_path = VENV_BASE / key
     python_path = _get_python_path(venv_path)
 
     if not python_path.exists():
-        await ctx.info(f"[olive-mcp] Creating venv with: {', '.join(packages)}")
+        _job_log(job_id, f"Creating venv with: {', '.join(packages)}")
         VENV_BASE.mkdir(parents=True, exist_ok=True)
 
         proc = await asyncio.create_subprocess_exec(
@@ -156,6 +179,7 @@ async def _get_or_create_venv(
         if proc.returncode != 0:
             raise RuntimeError(f"Failed to create venv: {stderr.decode()}")
 
+        _job_log(job_id, f"Installing packages: {', '.join(packages)}")
         proc = await asyncio.create_subprocess_exec(
             "uv", "pip", "install", "--python", str(python_path), *packages,
             stdout=asyncio.subprocess.PIPE,
@@ -165,59 +189,103 @@ async def _get_or_create_venv(
         if proc.returncode != 0:
             raise RuntimeError(f"Failed to install packages: {stderr.decode()}")
 
-        await ctx.info("[olive-mcp] Venv ready")
+        _job_log(job_id, "Venv ready")
     else:
-        await ctx.info(f"[olive-mcp] Reusing cached venv ({key})")
+        _job_log(job_id, f"Reusing cached venv ({key})")
 
     return python_path
 
 
 # ---------------------------------------------------------------------------
-# Worker execution
+# Worker execution (background)
 # ---------------------------------------------------------------------------
 
 
-async def _run_olive(
+_INTERESTING_KEYWORDS = [
+    "Running pass", "Pass ", "Downloading", "Loading", "Evaluating",
+    "Saving", "Model is saved", "Exporting", "Converting", "Quantizing",
+    "Optimizing", "Training", "Step ", "Epoch ", "loss", "accuracy",
+    "latency", "throughput", "WARNING", "ERROR", "Exception", "No output model",
+]
+
+
+def _is_interesting_line(line: str) -> bool:
+    """Filter out noisy log lines, keep only meaningful progress updates."""
+    if not line.strip():
+        return False
+    return any(kw in line for kw in _INTERESTING_KEYWORDS)
+
+
+async def _run_olive_background(
+    job_id: str,
     command: str,
     kwargs: dict,
     extra_packages: list[str],
-    ctx: Context[ServerSession, None],
-) -> dict:
-    """Run an olive command in an isolated venv via worker.py."""
-    packages = [*BASE_PACKAGES, *extra_packages]
-    python_path = await _get_or_create_venv(packages, ctx)
-
-    await ctx.info(f"[olive-mcp] Running: {command}")
-
-    proc = await asyncio.create_subprocess_exec(
-        str(python_path), str(WORKER_PATH), command, json.dumps(kwargs),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout_bytes, stderr_bytes = await proc.communicate()
-    stdout_str = stdout_bytes.decode("utf-8", errors="replace")
-    stderr_str = stderr_bytes.decode("utf-8", errors="replace")
-
-    if proc.returncode != 0:
-        await ctx.info(f"[olive-mcp] Failed: {command} (exit code {proc.returncode})")
-        return {
-            "status": "error",
-            "returncode": proc.returncode,
-            "error": stderr_str[-3000:],
-            "stdout": stdout_str[-1000:],
-        }
-
-    await ctx.info(f"[olive-mcp] Completed: {command}")
-
+):
+    """Background task: run olive in isolated venv, stream logs to job."""
     try:
-        return json.loads(stdout_str)
-    except json.JSONDecodeError:
-        return {
-            "status": "error",
-            "error": "Failed to parse worker JSON output",
-            "stdout": stdout_str[-3000:],
-            "stderr": stderr_str[-1000:],
-        }
+        _jobs[job_id]["status"] = "setting_up"
+        packages = [*BASE_PACKAGES, *extra_packages]
+        python_path = await _get_or_create_venv(packages, job_id)
+
+        _jobs[job_id]["status"] = "running"
+        _job_log(job_id, f"Running: olive {command}")
+
+        proc = await asyncio.create_subprocess_exec(
+            str(python_path), "-u", str(WORKER_PATH), command, json.dumps(kwargs),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        # Stream stderr (olive logs) line by line into job log
+        while True:
+            line = await proc.stderr.readline()
+            if not line:
+                break
+            decoded = line.decode("utf-8", errors="replace").rstrip()
+            if _is_interesting_line(decoded):
+                _job_log(job_id, decoded)
+
+        # Read stdout (JSON result)
+        stdout_bytes = await proc.stdout.read()
+        await proc.wait()
+        stdout_str = stdout_bytes.decode("utf-8", errors="replace")
+
+        if proc.returncode != 0:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["result"] = {
+                "status": "error",
+                "returncode": proc.returncode,
+                "error": stdout_str[-3000:],
+            }
+            _job_log(job_id, f"Failed with exit code {proc.returncode}")
+        else:
+            try:
+                result = json.loads(stdout_str)
+            except json.JSONDecodeError:
+                result = {"status": "error", "error": "Failed to parse output", "raw": stdout_str[-3000:]}
+
+            _jobs[job_id]["status"] = "completed" if result.get("status") == "success" else "error"
+            _jobs[job_id]["result"] = result
+            _job_log(job_id, "Completed successfully" if _jobs[job_id]["status"] == "completed" else "Completed with errors")
+
+    except Exception as exc:
+        _jobs[job_id]["status"] = "error"
+        _jobs[job_id]["result"] = {"status": "error", "error": str(exc)}
+        _job_log(job_id, f"Exception: {exc}")
+
+
+def _start_job(command: str, description: str, kwargs: dict, extra_packages: list[str]) -> dict:
+    """Create a job, launch background task, return immediately."""
+    job_id = _create_job(command, description)
+    asyncio.get_event_loop().create_task(
+        _run_olive_background(job_id, command, kwargs, extra_packages)
+    )
+    return {
+        "job_id": job_id,
+        "status": "running",
+        "message": f"Job started: {description}. Use get_job_status('{job_id}') to check progress.",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -243,9 +311,40 @@ async def list_supported_configs() -> dict:
 
 
 @mcp.tool()
+async def get_job_status(job_id: str, last_n_logs: int = 20) -> dict:
+    """Check the status and progress of a background job.
+
+    Call this repeatedly after starting an optimization/quantization/finetune job.
+    Each call returns the latest log lines so you can report progress to the user.
+    Keep calling until status is "completed" or "error".
+
+    Args:
+        job_id: The job ID returned by optimize/quantize/finetune/etc.
+        last_n_logs: Number of recent log lines to return. Default: 20.
+    """
+    if job_id not in _jobs:
+        return {"status": "not_found", "error": f"No job with id '{job_id}'"}
+
+    job = _jobs[job_id]
+    response = {
+        "job_id": job_id,
+        "status": job["status"],
+        "command": job["command"],
+        "description": job["description"],
+        "started_at": job["started_at"],
+        "recent_logs": job["log_lines"][-last_n_logs:],
+        "total_log_lines": len(job["log_lines"]),
+    }
+
+    if job["result"] is not None:
+        response["result"] = job["result"]
+
+    return response
+
+
+@mcp.tool()
 async def optimize(
     model_name_or_path: str,
-    ctx: Context[ServerSession, None],
     provider: str = "CPUExecutionProvider",
     device: str | None = None,
     precision: str = "fp32",
@@ -258,10 +357,7 @@ async def optimize(
     surgeries: list[str] | None = None,
     output_path: str | None = None,
 ) -> dict:
-    """Optimize a model end-to-end using Olive's auto-optimization pipeline.
-
-    Automatically selects the best passes (capture, convert, quantize, graph optimize)
-    based on model, device, and precision.
+    """Optimize a model end-to-end. Returns a job_id — use get_job_status() to poll progress.
 
     Args:
         model_name_or_path: HuggingFace model name or local path.
@@ -295,13 +391,12 @@ async def optimize(
         surgeries=surgeries,
         output_path=output_path,
     )
-    return await _run_olive("optimize", kwargs, [ort_package], ctx)
+    return _start_job("optimize", f"Optimize {model_name_or_path} ({precision}, {provider})", kwargs, [ort_package])
 
 
 @mcp.tool()
 async def quantize(
     model_name_or_path: str,
-    ctx: Context[ServerSession, None],
     algorithm: str = "rtn",
     precision: str = "int8",
     act_precision: str = "int8",
@@ -310,7 +405,7 @@ async def quantize(
     data_name: str | None = None,
     output_path: str | None = None,
 ) -> dict:
-    """Quantize a model to reduce size and improve inference speed.
+    """Quantize a model. Returns a job_id — use get_job_status() to poll progress.
 
     Args:
         model_name_or_path: HuggingFace model name or local path.
@@ -335,14 +430,13 @@ async def quantize(
         data_name=data_name,
         output_path=output_path,
     )
-    return await _run_olive("quantize", kwargs, ["onnxruntime"], ctx)
+    return _start_job("quantize", f"Quantize {model_name_or_path} ({algorithm}, {precision})", kwargs, ["onnxruntime"])
 
 
 @mcp.tool()
 async def finetune(
     model_name_or_path: str,
     data_name: str,
-    ctx: Context[ServerSession, None],
     method: str = "lora",
     lora_r: int = 64,
     lora_alpha: int = 16,
@@ -352,7 +446,7 @@ async def finetune(
     eval_split: str | None = None,
     output_path: str | None = None,
 ) -> dict:
-    """Fine-tune a model using LoRA or QLoRA.
+    """Fine-tune a model using LoRA or QLoRA. Returns a job_id — use get_job_status() to poll.
 
     Args:
         model_name_or_path: HuggingFace model name (e.g. "microsoft/Phi-3-mini-4k-instruct").
@@ -381,13 +475,12 @@ async def finetune(
         eval_split=eval_split,
         output_path=output_path,
     )
-    return await _run_olive("finetune", kwargs, [], ctx)
+    return _start_job("finetune", f"Finetune {model_name_or_path} ({method}) on {data_name}", kwargs, [])
 
 
 @mcp.tool()
 async def capture_onnx_graph(
     model_name_or_path: str,
-    ctx: Context[ServerSession, None],
     use_model_builder: bool = False,
     use_dynamo_exporter: bool = False,
     precision: str = "fp16",
@@ -397,7 +490,7 @@ async def capture_onnx_graph(
     use_ort_genai: bool = False,
     output_path: str | None = None,
 ) -> dict:
-    """Capture ONNX graph from a HuggingFace or PyTorch model.
+    """Capture ONNX graph from a model. Returns a job_id — use get_job_status() to poll.
 
     Args:
         model_name_or_path: HuggingFace model name or local path.
@@ -424,13 +517,12 @@ async def capture_onnx_graph(
         use_ort_genai=use_ort_genai if use_ort_genai else None,
         output_path=output_path,
     )
-    return await _run_olive("capture_onnx_graph", kwargs, ["onnxruntime"], ctx)
+    return _start_job("capture_onnx_graph", f"Capture ONNX from {model_name_or_path}", kwargs, ["onnxruntime"])
 
 
 @mcp.tool()
 async def benchmark(
     model_name_or_path: str,
-    ctx: Context[ServerSession, None],
     tasks: list[str] | None = None,
     device: str = "cpu",
     batch_size: int = 1,
@@ -438,7 +530,7 @@ async def benchmark(
     limit: float = 1.0,
     output_path: str | None = None,
 ) -> dict:
-    """Benchmark/evaluate a model using lm-eval tasks.
+    """Benchmark/evaluate a model. Returns a job_id — use get_job_status() to poll.
 
     Args:
         model_name_or_path: HuggingFace model name or local path.
@@ -464,13 +556,12 @@ async def benchmark(
         limit=limit,
         output_path=output_path,
     )
-    return await _run_olive("benchmark", kwargs, [ort_package], ctx)
+    return _start_job("benchmark", f"Benchmark {model_name_or_path} on {', '.join(tasks)}", kwargs, [ort_package])
 
 
 @mcp.tool()
 async def diffusion_lora(
     model_name_or_path: str,
-    ctx: Context[ServerSession, None],
     data_dir: str | None = None,
     data_name: str | None = None,
     model_variant: str = "auto",
@@ -485,7 +576,7 @@ async def diffusion_lora(
     merge_lora: bool = False,
     output_path: str | None = None,
 ) -> dict:
-    """Train LoRA adapters for diffusion models (SD 1.5, SDXL, Flux).
+    """Train LoRA for diffusion models. Returns a job_id — use get_job_status() to poll.
 
     Args:
         model_name_or_path: HuggingFace model name (e.g. "runwayml/stable-diffusion-v1-5").
@@ -522,19 +613,18 @@ async def diffusion_lora(
         merge_lora=merge_lora if merge_lora else None,
         output_path=output_path,
     )
-    return await _run_olive("diffusion_lora", kwargs, [], ctx)
+    return _start_job("diffusion_lora", f"Diffusion LoRA for {model_name_or_path}", kwargs, [])
 
 
 @mcp.tool()
 async def tune_session_params(
     model_name_or_path: str,
-    ctx: Context[ServerSession, None],
     cpu_cores: int | None = None,
     io_bind: bool = False,
     enable_cuda_graph: bool = False,
     output_path: str | None = None,
 ) -> dict:
-    """Tune ONNX Runtime session parameters for optimal inference performance.
+    """Tune ORT session params. Returns a job_id — use get_job_status() to poll.
 
     Args:
         model_name_or_path: Path to ONNX model.
@@ -553,7 +643,7 @@ async def tune_session_params(
         enable_cuda_graph=enable_cuda_graph if enable_cuda_graph else None,
         output_path=output_path,
     )
-    return await _run_olive("tune_session_params", kwargs, ["onnxruntime"], ctx)
+    return _start_job("tune_session_params", f"Tune session params for {model_name_or_path}", kwargs, ["onnxruntime"])
 
 
 @mcp.tool()
